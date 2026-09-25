@@ -33,6 +33,14 @@
   var ALLOWED = [
     "https://arcadecampushub.online",
     "https://www.arcadecampushub.online",
+    "https://nos-and-stealzers.github.io",
+    "https://arcadecampushub.github.io",
+    "https://securlyfex.online",
+    "https://www.securlyfex.online",
+    "https://securlyfex.site",
+    "https://www.securlyfex.site",
+    "https://securly.site",
+    "https://www.securly.site",
     "http://localhost:8787",
     "http://127.0.0.1:8787"
   ];
@@ -45,10 +53,8 @@
    * matched dots — so arcadecampushub.online.evil.com satisfied it, and any
    * attacker who registered that could read every save on this origin.
    * A wildcard that spans a dot spans a domain boundary; it must never. */
-  var ALLOWED_PATTERNS = [
-    /^https:\/\/[a-z0-9-]+\.vercel\.app$/i,
-    /^https:\/\/([a-z0-9-]+\.)?arcadecampushub\.online$/i
-  ];
+  // Add exact, trusted preview origins to ALLOWED; never trust all Vercel tenants.
+  var ALLOWED_PATTERNS = [];
 
   function permitted(origin) {
     if (ALLOWED.indexOf(origin) !== -1) return true;
@@ -60,12 +66,26 @@
 
   var MAX_VALUE = 512 * 1024;     // skip anything absurd, per key
 
+  /* The arcade's OWN app data lives under these prefixes on its origin. When
+     this bridge runs at the arcade root (for self-hosted games), a snapshot
+     must NOT sweep up the hub's favorites/settings/session — that would put
+     app state into a game-save row and a restore could clobber it. Games never
+     use these prefixes, so filtering them is safe on every origin. */
+  var APP_PREFIXES = ["ach:", "ach-", "sb-", "supabase."];
+  function isAppKey(key) {
+    for (var i = 0; i < APP_PREFIXES.length; i++) {
+      if (key.indexOf(APP_PREFIXES[i]) === 0) return true;
+    }
+    return false;
+  }
+
   function snapshot() {
     var out = {}, skipped = 0;
     try {
       for (var i = 0; i < localStorage.length; i++) {
         var key = localStorage.key(i);
         if (key === null) continue;
+        if (isAppKey(key)) continue;      // never back up the hub's own state
         var value = localStorage.getItem(key);
         if (value === null) continue;
         if (value.length > MAX_VALUE) { skipped++; continue; }
@@ -129,6 +149,7 @@
     var written = 0, kept = 0;
     try {
       Object.keys(data || {}).forEach(function (key) {
+        if (isAppKey(key)) { kept++; return; }   // never let a save touch app state
         var existing = localStorage.getItem(key);
         if (existing !== null && !overwrite) { kept++; return; }
         try { localStorage.setItem(key, String(data[key])); written++; }
@@ -150,7 +171,14 @@
    * rebuilt on the way back in.
    */
 
-  var IDB_BUDGET = 3 * 1024 * 1024;   // per origin, encoded
+  /* Budget for one origin's IndexedDB snapshot, encoded. The server accepts a
+     4 MB row (put_game_save), and that whole budget is for THIS origin's saves
+     (localStorage + cookies are tiny beside a Unity/Eaglercraft IDB dump), so
+     the relay budget is sized just under it to leave headroom for the JSON
+     envelope and the small stores. An earlier 3 MB cap silently dropped whole
+     databases — a real Eaglercraft world or FNAF World Unity save is bigger —
+     which is why those "only worked locally". */
+  var IDB_BUDGET = 3800 * 1024;   // per origin, encoded (server row cap is 4 MB)
 
   function b64(bytes) {
     var out = "";
@@ -219,10 +247,12 @@
     return indexedDB.databases().then(function (list) {
       var out = {};
       var used = 0;
+      var dropped = [];      // DBs skipped because the budget was already full
 
       return (list || []).reduce(function (chain, info) {
         return chain.then(function () {
-          if (!info.name || used > IDB_BUDGET) return;
+          if (!info.name) return;
+          if (used > IDB_BUDGET) { dropped.push(info.name); return; }
           return openDb(info.name).then(function (db) {
             var stores = Array.prototype.slice.call(db.objectStoreNames);
             if (!stores.length) { db.close(); return; }
@@ -258,6 +288,7 @@
                     var text = JSON.stringify(dbOut);
                     used += text.length;
                     if (used <= IDB_BUDGET) out[info.name] = dbOut;
+                    else dropped.push(info.name);
                     db.close();
                     resolve();
                   }
@@ -269,7 +300,7 @@
           }).catch(function () { /* locked or blocked — skip it */ });
         });
       }, Promise.resolve()).then(function () {
-        return { data: out, unsupported: false, bytes: used };
+        return { data: out, unsupported: false, bytes: used, dropped: dropped };
       });
     }).catch(function () { return { data: {}, unsupported: true }; });
   }
@@ -325,10 +356,12 @@
   }
 
   window.addEventListener("message", function (event) {
-    if (!permitted(event.origin)) return;
+    if (!permitted(event.origin) || event.source !== window.parent || window.parent === window) return;
 
     var msg = event.data;
     if (!msg || msg.channel !== "ach-save-bridge") return;
+    if (!((typeof msg.id === "string" && msg.id.length > 0 && msg.id.length <= 128) ||
+          (typeof msg.id === "number" && Number.isSafeInteger(msg.id) && msg.id > 0))) return;
 
     var reply = { channel: "ach-save-bridge", id: msg.id, ok: true };
 
@@ -344,6 +377,7 @@
         reply.idb = idb.data;
         reply.idbUnsupported = idb.unsupported;
         reply.idbBytes = idb.bytes || 0;
+        reply.idbDropped = idb.dropped || [];
         send(event, reply);
       }, function () { send(event, reply); });
       return;
