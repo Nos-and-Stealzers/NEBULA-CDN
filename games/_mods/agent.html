@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mod agent</title>
+<meta name="robots" content="noindex">
+<!-- Loaded by the mod menu next to a game served from play.<domain>. Same
+     origin as the game, so it can reach inside it; it only ever runs the
+     named cheats in game-cheats.js, and only for the hub's own pages. -->
+<script src="game-cheats.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  "use strict";
+  var CHANNEL = "ach-mods";
+  /* Any of the hub's own domains (main + mirrors), any subdomain. Keep in
+     step with SITE.domains in js/core/config.js. */
+  var TRUSTED = /^https:\/\/([a-z0-9-]+\.)?(arcadecampushub\.online|arcadecampushub\.space|arcadecampushub\.fun|poppersarcade\.online|geniussis\.online|geniussis\.space|securlyfex\.online|securlyfex\.site|securly\.site|securlyflex\.site|securlyflex\.space|geminii\.site)$/;
+
+  /* The game is the other frame on this origin in the same page. */
+  function game() {
+    var p = window.parent;
+    for (var i = 0; i < p.frames.length; i++) {
+      var w = p.frames[i];
+      if (w === window) continue;
+      try {
+        if (/save-bridge\.html|\/_mods\//.test(w.location.href)) continue;
+        if (w.document) return w;
+      } catch (e) { /* another origin */ }
+    }
+    return null;
+  }
+
+  var hooked = null;
+  function hook(w, origin) {
+    if (!w || hooked === w) return;
+    hooked = w;
+    /* Alt+M from inside the game still opens the menu. */
+    try {
+      w.addEventListener("keydown", function (e) {
+        if (e.altKey && (e.key === "m" || e.key === "M" || e.code === "KeyM")) {
+          window.parent.postMessage({ channel: CHANNEL, hotkey: true }, origin);
+        }
+      });
+    } catch (e) {}
+  }
+
+  window.addEventListener("message", function (e) {
+    if (e.source !== window.parent || !TRUSTED.test(e.origin)) return;
+    var m = e.data;
+    if (!m || m.channel !== CHANNEL || typeof m.id !== "number") return;
+    var w = game();
+    function reply(out) { e.source.postMessage({ channel: CHANNEL, reply: m.id, data: out }, e.origin); }
+    function fail(err) { reply({ error: String((err && err.message) || err) }); }
+    try {
+      if (!w) { reply({ error: "The game isn't loaded yet." }); return; }
+      hook(w, e.origin);
+      /* Some cheats (Unity saves) answer later, as a promise. */
+      /* "flush": the hub's Save button asks the game to write its progress out. */
+      if (m.action === "flush") {
+        Promise.resolve(window.GameCheats.flush ? window.GameCheats.flush(w) : { flushed: [], unity: [] })
+          .then(reply, fail);
+        return;
+      }
+      Promise.resolve(m.action === "run" ? window.GameCheats.run(w, String(m.cheat), m.arg) : window.GameCheats.inspect(w))
+        .then(reply, fail);
+    } catch (err) {
+      fail(err);
+    }
+  });
+})();
+</script>
+</body>
+</html>
